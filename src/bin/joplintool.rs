@@ -663,7 +663,7 @@ fn get_resource_id(client: &joplin::Client, title: &str) -> Result<String> {
     if matches.len() > 1 {
         Err(Error::TooManyResults(title.to_string()))
     } else if matches.len() < 1 {
-        Err(Error::TooManyResults(title.to_string()))
+        Err(Error::NoResults(title.to_string()))
     } else {
         Ok(matches[0].id.clone())
     }
