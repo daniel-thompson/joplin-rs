@@ -97,6 +97,11 @@ enum Commands {
 
     /// Tools to help clean up orphaned resources
     Clean {
+        /// Only select e-mails (which are frequently orphaned because
+        /// they are the basis of the TODO features
+        #[arg(short, long)]
+        email_only: bool,
+
         /// Automatically delete orphaned resources
         #[arg(short, long)]
         remove: bool,
@@ -196,7 +201,7 @@ fn app() -> Result<()> {
 
     match cli.command {
         Commands::Actions { subject } => do_actions(&client, &subject)?,
-        Commands::Clean { remove } => do_clean(&client, remove)?,
+        Commands::Clean { email_only, remove } => do_clean(&client, email_only, remove)?,
         Commands::Diary { last_week } => do_diary(&client, last_week)?,
         Commands::Dryrun { subject, action } => do_dryrun(&client, &subject, &action)?,
         Commands::Edit { subject } => do_edit(&client, &subject)?,
@@ -246,11 +251,14 @@ fn do_actions(client: &joplin::Client, subject: &str) -> Result<()> {
     Ok(())
 }
 
-fn do_clean(client: &joplin::Client, remove: bool) -> Result<()> {
+fn do_clean(client: &joplin::Client, email_only: bool, remove: bool) -> Result<()> {
     let resources = client.get_resources()?;
     let mut got_one = false;
     for resource in resources.iter() {
         if client.search_notes(&resource.id)?.len() == 0 {
+            if email_only && !resource.title.ends_with(".eml") {
+                continue;
+            }
             got_one = true;
             println!("{} {}", resource.id, resource.title);
             if remove {
