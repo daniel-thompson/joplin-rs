@@ -24,6 +24,9 @@ pub enum Error {
     #[error("This command is disabled and cannot be run")]
     DisabledCommand,
 
+    #[error("No kanban board is configured (set kanban_board in the configuration file)")]
+    NoKanbanBoard,
+
     #[error("IO error")]
     IOError(#[from] io::Error),
 
@@ -76,10 +79,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
+    /// API access token for the web clipper service
     token: String,
 
     #[serde(default = "default_uri")]
     uri: String,
+
+    /// Title of the kanban board note that new TODO items
+    /// are filed onto (instead of creating TODO notes)
+    kanban_board: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -165,6 +173,10 @@ enum Commands {
 
     /// Create a new TODO item, either from stdin or from the supplied mbox
     Todo {
+        /// Migrate existing TODO items onto the kanban board
+        #[arg(long)]
+        migrate: bool,
+
         /// Path to the mbox to add as a TODO
         mbox: Option<PathBuf>,
     },
@@ -202,7 +214,9 @@ fn app() -> Result<()> {
     match cli.command {
         Commands::Actions { subject } => do_actions(&client, &subject)?,
         Commands::Clean { email_only, remove } => do_clean(&client, email_only, remove)?,
-        Commands::Diary { last_week } => do_diary(&client, last_week)?,
+        Commands::Diary { last_week } => {
+            do_diary(&client, config.kanban_board.as_deref(), last_week)?
+        }
         Commands::Dryrun { subject, action } => do_dryrun(&client, &subject, &action)?,
         Commands::Edit { subject } => do_edit(&client, &subject)?,
         Commands::Grep { ignore_case, regex } => do_grep(&client, &regex, ignore_case)?,
@@ -215,7 +229,13 @@ fn app() -> Result<()> {
             action,
             args,
         } => do_run(&client, &subject, &action, &args)?,
-        Commands::Todo { mbox } => do_todo(&client, mbox)?,
+        Commands::Todo { migrate, mbox } => {
+            if migrate {
+                do_migrate(&client, config.kanban_board.as_deref())?;
+            } else {
+                do_todo(&client, config.kanban_board.as_deref(), mbox)?;
+            }
+        }
     }
 
     Ok(())
@@ -283,7 +303,7 @@ WARNING: Cleaning is a dangerous operation. If resources/notes are
     Ok(())
 }
 
-fn do_diary(client: &joplin::Client, last_week: bool) -> Result<()> {
+fn do_diary(client: &joplin::Client, kanban: Option<&str>, last_week: bool) -> Result<()> {
     let summary = client.search_notes("iscompleted:1 notebook:TODO type:todo")?;
 
     // fetch the complete note and sort by updated time (this ensures that
@@ -298,25 +318,33 @@ fn do_diary(client: &joplin::Client, last_week: bool) -> Result<()> {
         let date = time::OffsetDateTime::from_unix_timestamp(note.updated_time as i64)?;
         let diary_date = date.format(&time::format_description::well_known::Iso8601::DATE)?;
 
-        let diary = get_note_matching(client, &diary_date);
-
-        let markdown = format!("- [x] {}\n", note.title);
-
-        if let Ok(mut diary) = diary {
-            println!("Append to {}: {}", diary.title, note.title);
-            diary.body = diary.body + &markdown;
-            client.update_note(&diary)?;
-        } else {
-            println!("Create {}: {}", diary_date, note.title);
-            let folder_id = get_folder_id(client, "Diary")?;
-            let note = joplin::NoteTemplate::new(&diary_date)
-                .parent_id(folder_id.to_string())
-                .body(markdown);
-
-            let _ = client.post_note(note)?;
-        }
+        append_to_diary(client, &diary_date, &note.title)?;
 
         client.delete_note(&note.id)?;
+    }
+
+    // Migrate any completed tasks from the kanban board into the diary.
+    // The cards do not have their own timestamp so the updated_time of
+    // the board as a whole is used to pick the diary entry.
+    if let Some(board_name) = kanban {
+        let mut board = get_note_matching(client, board_name)?;
+        let (body, tasks) = kanban_remove_done(&board.body);
+
+        if !tasks.is_empty() {
+            let date = time::OffsetDateTime::from_unix_timestamp(board.updated_time as i64)?;
+            let diary_date = date.format(&time::format_description::well_known::Iso8601::DATE)?;
+
+            for task in tasks.iter() {
+                append_to_diary(client, &diary_date, task)?;
+            }
+
+            println!(
+                "Removing {} task(s) from kanban board {board_name}",
+                tasks.len()
+            );
+            board.body = body;
+            client.update_note(&board)?;
+        }
     }
 
     if last_week {
@@ -334,6 +362,28 @@ fn do_diary(client: &joplin::Client, last_week: bool) -> Result<()> {
                 print!("# {date}\n\n{}\n\n", note.body);
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Append a completed task to the diary entry for the specified date
+/// (creating the entry if it does not already exist)
+fn append_to_diary(client: &joplin::Client, diary_date: &str, title: &str) -> Result<()> {
+    let markdown = format!("- [x] {title}\n");
+
+    if let Ok(mut diary) = get_note_matching(client, diary_date) {
+        println!("Append to {}: {}", diary.title, title);
+        diary.body = diary.body + &markdown;
+        client.update_note(&diary)?;
+    } else {
+        println!("Create {diary_date}: {title}");
+        let folder_id = get_folder_id(client, "Diary")?;
+        let note = joplin::NoteTemplate::new(diary_date)
+            .parent_id(folder_id.to_string())
+            .body(markdown);
+
+        let _ = client.post_note(note)?;
     }
 
     Ok(())
@@ -473,7 +523,11 @@ fn do_show(client: &joplin::Client, subject: &str) -> Result<()> {
     Ok(())
 }
 
-fn do_todo<P: AsRef<Path>>(client: &joplin::Client, mbox: Option<P>) -> Result<()> {
+fn do_todo<P: AsRef<Path>>(
+    client: &joplin::Client,
+    kanban: Option<&str>,
+    mbox: Option<P>,
+) -> Result<()> {
     let raw = if let Some(fname) = mbox {
         fs::read_to_string(fname)?
     } else {
@@ -494,7 +548,6 @@ fn do_todo<P: AsRef<Path>>(client: &joplin::Client, mbox: Option<P>) -> Result<(
 
     let subject = nibble_subject(msg.subject().unwrap_or("[empty subject]"));
     let resource_title = format!("{subject}.eml");
-    let folder_id = get_folder_id(client, "TODO")?;
 
     let resource_id = get_resource_id(client, &resource_title);
     if let Ok(resource_id) = resource_id {
@@ -502,10 +555,16 @@ fn do_todo<P: AsRef<Path>>(client: &joplin::Client, mbox: Option<P>) -> Result<(
         let mbox = client.get_resource(&resource_id)? + &mbox;
         client.update_resource(&resource_id, &mbox)?;
 
-        // Do we need to re-create the todo item
-        let needle = format!("{} iscompleted:0 notebook:TODO type:todo", resource_id);
-        if client.search_notes(&needle)?.len() == 0 {
-            create_note_from_message(client, &folder_id, &msg, &resource_id)?;
+        if let Some(board) = kanban {
+            // The kanban helpers de-duplicate internally
+            add_task_to_kanban(client, board, &msg, &resource_id)?;
+        } else {
+            // Do we need to re-create the todo item
+            let needle = format!("{} iscompleted:0 notebook:TODO type:todo", resource_id);
+            if client.search_notes(&needle)?.len() == 0 {
+                let folder_id = get_folder_id(client, "TODO")?;
+                create_note_from_message(client, &folder_id, &msg, &resource_id)?;
+            }
         }
 
         return Ok(());
@@ -520,7 +579,66 @@ fn do_todo<P: AsRef<Path>>(client: &joplin::Client, mbox: Option<P>) -> Result<(
     let template = joplin::ResourceTemplate::new(&resource_title);
     let resource = client.post_resource(template, &mbox)?;
 
-    create_note_from_message(client, &folder_id, &msg, &resource.id)?;
+    if let Some(board) = kanban {
+        add_task_to_kanban(client, board, &msg, &resource.id)?;
+    } else {
+        let folder_id = get_folder_id(client, "TODO")?;
+        create_note_from_message(client, &folder_id, &msg, &resource.id)?;
+    }
+
+    Ok(())
+}
+
+/// Migrate outstanding TODO items onto the kanban board. Tasks that
+/// were created from an e-mail are replaced by a simple resource link,
+/// any other task has its body copied onto the card.
+fn do_migrate(client: &joplin::Client, kanban: Option<&str>) -> Result<()> {
+    let board_name = kanban.ok_or(Error::NoKanbanBoard)?;
+
+    let todos = client.search_notes("iscompleted:0 notebook:TODO type:todo")?;
+    if todos.is_empty() {
+        println!("No TODO items to migrate");
+        return Ok(());
+    }
+
+    // fetch the complete notes and sort by updated time (this ensures
+    // that the tasks end up on the board in age order)
+    let mut notes = todos
+        .into_iter()
+        .map(|n| client.get_note(&n.id))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    notes.sort_by(|a, b| a.updated_time.total_cmp(&b.updated_time));
+
+    // Build the new board locally so that nothing is deleted until
+    // every task has been successfully filed
+    let mut board = get_note_matching(client, board_name)?;
+    let mut migrated = false;
+
+    for note in notes.iter() {
+        let card_body = todo_card_body(&note.body);
+
+        match kanban_add_card(&board.body, &note.title, &card_body)? {
+            Some(body) => {
+                println!("Adding task to kanban board {board_name}: {}", note.title);
+                board.body = body;
+                migrated = true;
+            }
+            None => println!(
+                "Task is already on the kanban board {board_name}: {}",
+                note.title
+            ),
+        }
+    }
+
+    if migrated {
+        client.update_note(&board)?;
+    }
+
+    // The TODO items are only deleted once their task is on the board
+    // (tasks that were already on the board are also removed)
+    for note in notes.iter() {
+        client.delete_note(&note.id)?;
+    }
 
     Ok(())
 }
@@ -570,6 +688,234 @@ fn create_note_from_message(
     let _ = client.post_note(note)?;
 
     Ok(())
+}
+
+fn add_task_to_kanban(
+    client: &joplin::Client,
+    board: &str,
+    msg: &Message,
+    resource_id: &str,
+) -> Result<()> {
+    let mut note = get_note_matching(client, board)?;
+    let subject = nibble_subject(msg.subject().unwrap_or("[empty subject]"));
+
+    let card = format!("[ ](:/{resource_id})");
+    match kanban_add_card(&note.body, subject, &card)? {
+        Some(body) => {
+            println!("Adding task to kanban board {board}: {subject}");
+            note.body = body;
+            client.update_note(&note)?;
+        }
+        None => println!("Task is already on the kanban board {board}: {subject}"),
+    }
+
+    Ok(())
+}
+
+/// Add a new card to the body of a kanban board note.
+///
+/// The board is a markdown note managed by the Joplin kanban plugin:
+/// the H1 headings are the columns and the H2 headings are the cards.
+/// The card is filed into the first column whose title includes
+/// "Today" or "Now" unless an identical card (one with the same
+/// title) already exists in a column other than "Spiked" or "Done"
+/// (in which case the board is left unchanged and None is returned).
+fn kanban_add_card(board: &str, title: &str, card_body: &str) -> Result<Option<String>> {
+    let lines: Vec<&str> = board.lines().collect();
+
+    // Scan the board looking for the column that the new card belongs
+    // in and for identical cards that are already on the board. Fenced
+    // blocks must be skipped since they can contain lines that look
+    // like headings (e.g. the kanban-settings block).
+    let mut column = String::new();
+    let mut fenced = false;
+    let mut settings = None;
+    let mut target = None;
+    let mut insert_at = None;
+    let mut duplicate = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        let line = line.trim_start();
+
+        if line.starts_with("```") {
+            if !fenced && settings.is_none() && line.starts_with("```kanban-settings") {
+                settings = Some(i);
+            }
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+
+        if let Some(heading) = line.strip_prefix("# ") {
+            let heading = heading.trim();
+            let lheading = heading.to_lowercase();
+
+            match target {
+                // The new card is filed into the first "live" column...
+                None => {
+                    if lheading.contains("today") || lheading.contains("now") {
+                        target = Some(i);
+                    }
+                }
+                // ...which ends where the next column begins
+                Some(t) => {
+                    if insert_at.is_none() && i > t {
+                        insert_at = Some(i);
+                    }
+                }
+            }
+
+            column = heading.to_string();
+        } else if let Some(card) = line.strip_prefix("## ") {
+            let lcolumn = column.to_lowercase();
+            if card.trim() == title && !(lcolumn.contains("spiked") || lcolumn.contains("done")) {
+                duplicate = true;
+            }
+        }
+    }
+
+    if duplicate {
+        return Ok(None);
+    }
+
+    if target.is_none() {
+        return Err(Error::NoResults(
+            "Today or Now column on the kanban board".to_string(),
+        ));
+    }
+    let insert_at = insert_at.unwrap_or_else(|| settings.unwrap_or(lines.len()));
+
+    let card = format!("## {title}\n\n{}\n\n", card_body.trim());
+    let card: Vec<&str> = card.lines().collect();
+
+    let mut new_lines: Vec<&str> = Vec::with_capacity(lines.len() + card.len());
+    new_lines.extend_from_slice(&lines[..insert_at]);
+    new_lines.extend_from_slice(&card);
+    new_lines.extend_from_slice(&lines[insert_at..]);
+
+    let mut new_body = new_lines.join("\n");
+    if board.ends_with('\n') {
+        new_body.push('\n');
+    }
+
+    Ok(Some(new_body))
+}
+
+/// Demote all markdown headings by two levels (H1 becomes H3) so that
+/// they can be embedded within a kanban card. Fenced blocks (both
+/// backtick and tilde style) are left alone.
+fn demote_headings(body: &str) -> String {
+    let mut out = String::new();
+    let mut fence: Option<&str> = None;
+
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+
+        if let Some(marker) = fence {
+            if trimmed.starts_with(marker) {
+                fence = None;
+            }
+        } else if trimmed.starts_with("```") {
+            fence = Some("```");
+        } else if trimmed.starts_with("~~~") {
+            fence = Some("~~~");
+        } else {
+            let level = trimmed.chars().take_while(|&c| c == '#').count();
+            if level > 0 && trimmed[level..].starts_with(' ') {
+                out.push_str(&"#".repeat(level + 2));
+                out.push_str(&trimmed[level..]);
+                out.push('\n');
+                continue;
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Determine the card body for a TODO item. Tasks that were created
+/// from an e-mail (they contain an "Open in mail application" link)
+/// are reduced to a simple resource link, any other task has its body
+/// copied onto the card (with headings demoted so that they cannot be
+/// mistaken for board columns).
+fn todo_card_body(body: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\[Open in mail application\]\(:/([0-9a-f]+)\)").unwrap()
+    });
+
+    if let Some(caps) = re.captures(body) {
+        format!("[ ](:/{})", caps.get(1).unwrap().as_str())
+    } else {
+        demote_headings(body)
+    }
+}
+
+/// Remove all cards from the "Done" and "Spiked" columns of a kanban
+/// board body, returning the new body along with the titles of the
+/// removed cards (in board order).
+fn kanban_remove_done(body: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut removed: Vec<String> = Vec::new();
+
+    // Fenced blocks must be skipped since they can contain lines that
+    // look like headings (e.g. the kanban-settings block).
+    let mut column = String::new();
+    let mut fenced = false;
+    let mut removing = false;
+
+    for line in lines.iter() {
+        let trimmed = line.trim_start();
+
+        if trimmed.starts_with("```") {
+            if !fenced && trimmed.starts_with("```kanban-settings") {
+                // the settings block always lives at the end of the
+                // note so it terminates any card removal
+                removing = false;
+            }
+            fenced = !fenced;
+            if !removing {
+                kept.push(line);
+            }
+            continue;
+        }
+        if fenced {
+            if !removing {
+                kept.push(line);
+            }
+            continue;
+        }
+
+        if let Some(title) = trimmed.strip_prefix("# ") {
+            column = title.trim().to_string();
+            removing = false;
+            kept.push(line);
+        } else if let Some(title) = trimmed.strip_prefix("## ") {
+            let lcolumn = column.to_lowercase();
+            removing = lcolumn.contains("done") || lcolumn.contains("spiked");
+
+            if removing {
+                removed.push(title.trim().to_string());
+            } else {
+                kept.push(line);
+            }
+        } else if !removing {
+            kept.push(line);
+        }
+    }
+
+    let mut new_body = kept.join("\n");
+    if body.ends_with('\n') && !new_body.is_empty() {
+        new_body.push('\n');
+    }
+
+    (new_body, removed)
 }
 
 fn get_actions<'x>(body: &'x str, tag: &'x str) -> impl Iterator<Item = (&'x str, &'x str)> + 'x {
@@ -701,4 +1047,155 @@ fn to_mbox_header(msg: &Message) -> Option<String> {
     let date = time::OffsetDateTime::from_unix_timestamp(date.to_timestamp()).ok()?;
 
     Some(format!("From {} {}", email, date.format(format).ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kanban_new_task() {
+        let board = "# Backlog\n\n## Old task\n\n# Today\n\n# Done\n";
+        let body = kanban_add_card(board, "New task", "[ ](:/abc123)")
+            .unwrap()
+            .unwrap();
+
+        // the new card is filed at the end of the Today column
+        assert_eq!(
+            body,
+            "# Backlog\n\n## Old task\n\n# Today\n\n## New task\n\n[ ](:/abc123)\n\n# Done\n"
+        );
+    }
+
+    #[test]
+    fn kanban_duplicate_active() {
+        // a task that is already on the board is not duplicated
+        let board = "# Today\n\n## Existing task\n";
+        assert!(kanban_add_card(board, "Existing task", "[ ](:/abc123)")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn kanban_duplicate_done() {
+        // a done task is re-filed into the Today column
+        let board = "# Today\n\n# Done\n\n## Existing task\n";
+        let body = kanban_add_card(board, "Existing task", "[ ](:/abc123)")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            body,
+            "# Today\n\n## Existing task\n\n[ ](:/abc123)\n\n# Done\n\n## Existing task\n"
+        );
+    }
+
+    #[test]
+    fn kanban_last_column() {
+        // if the target column is the last one then the new card must
+        // be inserted before the kanban-settings block (whose contents
+        // must not be mistaken for a column heading)
+        let board = "# Today\n\n```kanban-settings\n# Do not remove this block\n```\n";
+        let body = kanban_add_card(board, "New task", "[ ](:/abc123)")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            body,
+            "# Today\n\n## New task\n\n[ ](:/abc123)\n\n```kanban-settings\n# Do not remove this block\n```\n"
+        );
+    }
+
+    #[test]
+    fn kanban_no_today_column() {
+        assert!(kanban_add_card("# Backlog\n", "New task", "[ ](:/abc123)").is_err());
+    }
+
+    #[test]
+    fn kanban_remove_done_tasks() {
+        let board = "# Today\n\n## Busy task\n\n# Done\n\n## Finished task\n\n[ ](:/abc123)\n\n## Another done task\n\n# Backlog\n";
+        let (body, tasks) = kanban_remove_done(board);
+
+        assert_eq!(body, "# Today\n\n## Busy task\n\n# Done\n\n# Backlog\n");
+        assert_eq!(tasks, vec!["Finished task", "Another done task"]);
+    }
+
+    #[test]
+    fn kanban_remove_spiked_tasks() {
+        let board = "# Spiked\n\n## Old task\n\n# Today\n\n## Busy task\n";
+        let (body, tasks) = kanban_remove_done(board);
+
+        assert_eq!(body, "# Spiked\n\n# Today\n\n## Busy task\n");
+        assert_eq!(tasks, vec!["Old task"]);
+    }
+
+    #[test]
+    fn kanban_remove_settings_block() {
+        // the settings block must survive even when it follows the
+        // last column
+        let board =
+            "# Done\n\n## Finished task\n\n```kanban-settings\n# Do not remove this block\n```\n";
+        let (body, tasks) = kanban_remove_done(board);
+
+        assert_eq!(
+            body,
+            "# Done\n\n```kanban-settings\n# Do not remove this block\n```\n"
+        );
+        assert_eq!(tasks, vec!["Finished task"]);
+    }
+
+    #[test]
+    fn kanban_remove_nothing() {
+        let board = "# Today\n\n## Busy task\n\n# Done\n";
+        let (body, tasks) = kanban_remove_done(board);
+
+        assert_eq!(body, board);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn kanban_add_card_with_body() {
+        let board = "# Today\n\n# Done\n";
+        let card = demote_headings("# Heading\n\nBody text\n");
+        let body = kanban_add_card(board, "New task", &card).unwrap().unwrap();
+
+        assert_eq!(
+            body,
+            "# Today\n\n## New task\n\n### Heading\n\nBody text\n\n# Done\n"
+        );
+    }
+
+    #[test]
+    fn demote_headings_simple() {
+        assert_eq!(
+            demote_headings("# H1\n## H2\nText\n### H3\n"),
+            "### H1\n#### H2\nText\n##### H3\n"
+        );
+    }
+
+    #[test]
+    fn demote_headings_fenced() {
+        // headings inside fenced blocks are left alone (and a tilde
+        // fence neither terminates nor opens a backtick fence)
+        let body = "# H1\n```sh\n# comment\n~~~\n# not a comment\n~~~\n```\n~~~\n# tilde comment\n~~~\n# H2\n";
+        assert_eq!(
+            demote_headings(body),
+            "### H1\n```sh\n# comment\n~~~\n# not a comment\n~~~\n```\n~~~\n# tilde comment\n~~~\n### H2\n"
+        );
+    }
+
+    #[test]
+    fn todo_card_from_email() {
+        let body = "[Open in mail application](:/e4c5187d17f24f3699262003b4371f70)\n\n**From:** *someone*\n\nSome text\n";
+        assert_eq!(
+            todo_card_body(body),
+            "[ ](:/e4c5187d17f24f3699262003b4371f70)"
+        );
+    }
+
+    #[test]
+    fn todo_card_from_body() {
+        let body = "# Heading\n\nSome text\n";
+        assert_eq!(todo_card_body(body), "### Heading\n\nSome text\n");
+    }
 }
